@@ -32,10 +32,24 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Restore halal screening cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache/halal_mizan.json
+          key: halal-mizan-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            halal-mizan-
+
       - name: Screen halal stocks
-        env:
-          HALAL_CHECK_LIMIT: '0'
+        id: halal
         run: python halal_screen.py
+
+      - name: Save updated halal cache
+        if: steps.halal.outputs.cache_changed == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .cache/halal_mizan.json
+          key: halal-mizan-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Run stock scanner
         env:
@@ -56,4 +70,3 @@ jobs:
             approved_halal.csv
           if-no-files-found: warn
           retention-days: 7
-          
