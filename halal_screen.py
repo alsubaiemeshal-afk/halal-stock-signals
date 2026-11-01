@@ -1,26 +1,34 @@
 
 import csv
+import io
 import logging
 import os
 import re
 import time
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone, date
 
 import requests
 
-MIZAN_URL = "https://askmizan.com/api/v1/screen"
-HALALWALLET_URL = (
+WALLET_URL = (
     "https://www.halalwallet.us/api/data/"
     "halal-stock-screening-data-us.json"
 )
+MIZAN_URL = "https://askmizan.com/api/v1/screen"
 
-INPUT_FILE = "us_stocks.csv"
+NASDAQ_URL = (
+    "https://www.nasdaqtrader.com/dynamic/"
+    "SymDir/nasdaqlisted.txt"
+)
+OTHER_URL = (
+    "https://www.nasdaqtrader.com/dynamic/"
+    "SymDir/otherlisted.txt"
+)
+
 APPROVED_FILE = "approved_halal.csv"
 REPORT_FILE = "halal_candidates.csv"
 
-STANDARD = "AAOIFI"
-CHECK_LIMIT = int(os.getenv("HALAL_CHECK_LIMIT", "0"))
-MAX_DATA_AGE_DAYS = 365
+MAX_AGE_DAYS = 365
+TIMEOUT = 30
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,52 +37,73 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-def read_symbols():
-    with open(INPUT_FILE, encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        if not reader.fieldnames or "symbol" not in reader.fieldnames:
-            raise ValueError("us_stocks.csv needs a symbol column")
-
-        symbols = {
-            row["symbol"].strip().upper()
-            for row in reader
-            if row.get("symbol")
-        }
-
-    symbols = sorted(
-        s for s in symbols
-        if re.fullmatch(r"[A-Z][A-Z0-9.-]{0,9}", s)
+def valid_symbol(value):
+    return (
+        isinstance(value, str)
+        and re.fullmatch(
+            r"[A-Z][A-Z0-9.-]{0,9}",
+            value.upper()
+        ) is not None
     )
 
-    return symbols[:CHECK_LIMIT] if CHECK_LIMIT > 0 else symbols
 
-
-def recent_date(value):
+def fresh(value):
     if not isinstance(value, str):
         return False
-
     try:
-        checked = date.fromisoformat(value[:10])
-        age = (datetime.now(timezone.utc).date() - checked).days
-        return 0 <= age <= MAX_DATA_AGE_DAYS
+        d = date.fromisoformat(value[:10])
+        age = (datetime.now(timezone.utc).date() - d).days
+        return 0 <= age <= MAX_AGE_DAYS
     except ValueError:
         return False
 
 
-def wallet_pass(row):
-    if not isinstance(row, dict):
-        return False
+def fetch_listed(session):
+    symbols = set()
 
+    for url, field in (
+        (NASDAQ_URL, "Symbol"),
+        (OTHER_URL, "ACT Symbol"),
+    ):
+        response = session.get(url, timeout=TIMEOUT)
+        response.raise_for_status()
+
+        reader = csv.DictReader(
+            io.StringIO(response.text),
+            delimiter="|"
+        )
+
+        for row in reader:
+            symbol = row.get(field, "").strip().upper()
+
+            if not valid_symbol(symbol):
+                continue
+
+            if row.get("Test Issue", "N") == "Y":
+                continue
+
+            if row.get("ETF", "N") == "Y":
+                continue
+
+            symbols.add(symbol)
+
+    if not symbols:
+        raise RuntimeError("No exchange symbols downloaded")
+
+    return symbols
+
+
+def wallet_pass(row):
     if row.get("entityType") != "stock":
         return False
 
-    if row.get("basis") != STANDARD:
+    if row.get("basis") != "AAOIFI":
         return False
 
     if row.get("verdict") != "halal":
         return False
 
-    required_flags = (
+    flags = (
         "businessActivityPass",
         "financialScreenPass",
         "debtPass",
@@ -83,34 +112,36 @@ def wallet_pass(row):
         "filingVerified",
     )
 
-    if not all(row.get(key) is True for key in required_flags):
+    if not all(row.get(k) is True for k in flags):
         return False
 
-    limits = (
+    for key, limit in (
         ("debtPct", 30),
         ("cashPct", 30),
         ("impermissibleIncomePct", 5),
-    )
-
-    for key, maximum in limits:
+    ):
         value = row.get(key)
 
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not 0 <= value <= limit
+        ):
             return False
 
-        if not 0 <= value <= maximum:
-            return False
-
-    return recent_date(row.get("dataAsOf"))
+    return fresh(row.get("dataAsOf"))
 
 
-def mizan_pass(data):
+def mizan_pass(data, symbol):
     if not isinstance(data, dict):
         return False
 
-    business = data.get("business")
-    summary = data.get("summary")
-    screens = data.get("screens")
+    if str(data.get("ticker", "")).upper() != symbol:
+        return False
+
+    business = data.get("business", {})
+    summary = data.get("summary", {})
+    screens = data.get("screens", [])
 
     if not isinstance(business, dict):
         return False
@@ -127,14 +158,22 @@ def mizan_pass(data):
     if summary.get("business_screen") != "pass":
         return False
 
-    if business.get("by_standard", {}).get(STANDARD) != "pass":
+    standards = business.get("by_standard", {})
+
+    if not isinstance(standards, dict):
+        return False
+
+    if standards.get("AAOIFI") != "pass":
+        return False
+
+    if not fresh(data.get("as_of")):
         return False
 
     for screen in screens:
-        if not isinstance(screen, dict):
-            continue
-
-        if screen.get("standard") == STANDARD:
+        if (
+            isinstance(screen, dict)
+            and screen.get("standard") == "AAOIFI"
+        ):
             return (
                 screen.get("compliant") is True
                 and screen.get("debt_compliant") is True
@@ -144,17 +183,28 @@ def mizan_pass(data):
     return False
 
 
-def main():
-    symbols = read_symbols()
-    log.info("Checking %d stocks", len(symbols))
+def write_csv(path, header, rows):
+    with open(
+        path, "w",
+        newline="",
+        encoding="utf-8"
+    ) as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        writer.writerows(rows)
 
+
+def main():
     session = requests.Session()
     session.headers.update({
         "User-Agent": "HalalStockSignals/1.0",
         "Accept": "application/json",
     })
 
-    response = session.get(HALALWALLET_URL, timeout=30)
+    listed = fetch_listed(session)
+    log.info("US exchange symbols: %d", len(listed))
+
+    response = session.get(WALLET_URL, timeout=TIMEOUT)
     response.raise_for_status()
 
     payload = response.json()
@@ -163,73 +213,89 @@ def main():
     if not isinstance(records, list) or not records:
         raise RuntimeError("Invalid HalalWallet dataset")
 
-    wallet = {
-        row["ticker"].upper(): row
-        for row in records
-        if isinstance(row, dict)
-        and row.get("entityType") == "stock"
-        and isinstance(row.get("ticker"), str)
-    }
+    # Only currently listed, covered, verified stocks.
+    candidates = {}
+
+    for row in records:
+        if not isinstance(row, dict):
+            continue
+
+        symbol = str(row.get("ticker") or "").upper()
+
+        if (
+            symbol in listed
+            and wallet_pass(row)
+        ):
+            candidates[symbol] = row
+
+    log.info(
+        "HalalWallet eligible candidates: %d",
+        len(candidates)
+    )
 
     approved = []
     report = []
+
     checked_at = datetime.now(timezone.utc).isoformat()
 
-    for i, symbol in enumerate(symbols, 1):
-        row = wallet.get(symbol)
+    for index, symbol in enumerate(
+        sorted(candidates), 1
+    ):
+        try:
+            response = session.get(
+                f"{MIZAN_URL}/{symbol}",
+                timeout=15
+            )
 
-        if row is None:
-            status = "not_in_halalwallet"
-        elif not wallet_pass(row):
-            status = "wallet_not_approved"
-        else:
-            try:
-                r = session.get(
-                    f"{MIZAN_URL}/{symbol}",
-                    timeout=15
-                )
+            if response.status_code == 404:
+                status = "not_in_mizan"
+            else:
+                response.raise_for_status()
 
-                if r.status_code == 404:
-                    status = "not_in_mizan"
+                if mizan_pass(response.json(), symbol):
+                    status = "approved"
+                    approved.append(symbol)
                 else:
-                    r.raise_for_status()
-                    data = r.json()
+                    status = "mizan_not_approved"
 
-                    if (
-                        isinstance(data, dict)
-                        and data.get("ticker", "").upper() == symbol
-                        and mizan_pass(data)
-                    ):
-                        status = "approved"
-                        approved.append(symbol)
-                    else:
-                        status = "mizan_not_approved"
+        except (requests.RequestException, ValueError) as exc:
+            log.warning("%s API error: %s", symbol, exc)
+            status = "api_error"
 
-            except (requests.RequestException, ValueError) as exc:
-                log.warning("%s: %s", symbol, exc)
-                status = "api_error"
+        report.append([
+            symbol,
+            status,
+            checked_at
+        ])
 
-            time.sleep(0.5)
+        log.info(
+            "%d/%d %s: %s",
+            index,
+            len(candidates),
+            symbol,
+            status
+        )
 
-        report.append([symbol, status, checked_at])
-        log.info("%d/%d %s: %s", i, len(symbols), symbol, status)
+        time.sleep(0.5)
 
-    # Write files only after screening has finished.
-    with open(APPROVED_FILE, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["symbol"])
-        writer.writerows([[symbol] for symbol in approved])
+    # Fail closed: never keep an old approval list.
+    write_csv(
+        APPROVED_FILE,
+        ["symbol"],
+        [[symbol] for symbol in approved]
+    )
 
-    with open(REPORT_FILE, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["symbol", "status", "checked_at_utc"])
-        writer.writerows(report)
+    write_csv(
+        REPORT_FILE,
+        ["symbol", "status", "checked_at_utc"],
+        report
+    )
 
     log.info("Approved stocks: %d", len(approved))
-    log.info("Approved file: %s", APPROVED_FILE)
+    log.info("Screening completed")
 
     if not approved:
-        log.warning("No stocks approved; scanner must skip trading signals.")
+        log.warning("No approved stocks. No signals allowed.")
 
 
 if __name__ == "__main__":
