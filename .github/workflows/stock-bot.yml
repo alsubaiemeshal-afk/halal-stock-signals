@@ -3,7 +3,6 @@ name: Halal Stock Signals 24H
 
 on:
   workflow_dispatch:
-
   schedule:
     - cron: '*/5 * * * *'
 
@@ -33,10 +32,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Test halal screening source
-        continue-on-error: true
+      - name: Screen halal stocks
         env:
-          HALAL_CHECK_LIMIT: '20'
+          HALAL_CHECK_LIMIT: '0'
         run: python halal_screen.py
 
       - name: Run stock scanner
@@ -47,3 +45,15 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TEST_MODE: 'true'
         run: python bot.py
+
+      - name: Upload screening report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: halal-screening-report
+          path: |
+            halal_candidates.csv
+            approved_halal.csv
+          if-no-files-found: warn
+          retention-days: 7
+          
