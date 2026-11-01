@@ -1,10 +1,11 @@
 
-name: Halal Stock Signals
+name: Halal Stock Signals 24H
 
 on:
   workflow_dispatch:
+
   schedule:
-    - cron: '*/15 * * * 1-5'
+    - cron: '*/5 * * * *'
 
 permissions:
   contents: read
@@ -25,10 +26,12 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.13'
+          python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Run stock scanner
         env:
@@ -36,5 +39,5 @@ jobs:
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TEST_MODE: 'true'
         run: python bot.py
-        
