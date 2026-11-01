@@ -9,6 +9,11 @@ from datetime import datetime, timezone
 
 import requests
 
+
+# ==========================================
+# SETTINGS
+# ==========================================
+
 API_BASE = "https://askmizan.com/api/v1/screen"
 
 INPUT_FILE = "us_stocks.csv"
@@ -24,6 +29,7 @@ CHECK_LIMIT = int(
 REQUEST_DELAY = 0.5
 REQUEST_TIMEOUT = 15
 
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s"
@@ -32,7 +38,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# ==========================================
+# READ STOCK SYMBOLS
+# ==========================================
+
 def read_symbols():
+
     if not os.path.isfile(INPUT_FILE):
         raise FileNotFoundError(
             f"Missing file: {INPUT_FILE}"
@@ -44,6 +55,7 @@ def read_symbols():
         encoding="utf-8-sig",
         newline=""
     ) as file:
+
         lines = [
             line.strip()
             for line in file
@@ -53,7 +65,6 @@ def read_symbols():
     if not lines:
         return []
 
-    # إزالة أي فراغات أو أحرف مخفية
     header = lines[0].strip().lower()
 
     if header not in ("symbol", "ticker"):
@@ -64,7 +75,12 @@ def read_symbols():
     symbols = set()
 
     for line in lines[1:]:
-        symbol = line.split(",")[0].strip().upper()
+
+        symbol = (
+            line.split(",")[0]
+            .strip()
+            .upper()
+        )
 
         if re.fullmatch(
             r"[A-Z][A-Z0-9.-]{0,9}",
@@ -75,52 +91,101 @@ def read_symbols():
     return sorted(symbols)
 
 
+# ==========================================
+# BUSINESS SCREENING
+# ==========================================
+
 def business_check(data):
-    business = data.get("business")
+
+    business = data.get("business", {})
+    summary = data.get("summary", {})
 
     if not isinstance(business, dict):
         return False
 
+    if not isinstance(summary, dict):
+        return False
+
+    main_business = business.get(
+        "main_business"
+    )
+
+    business_screen = summary.get(
+        "business_screen"
+    )
+
     return (
-        business.get("main_business") == "permitted"
-        and business.get("business_screen") == "pass"
+        main_business == "permitted"
+        and business_screen == "pass"
     )
 
 
+# ==========================================
+# AAOIFI DEBT SCREENING
+# ==========================================
+
 def debt_check(data):
-    screens = data.get("screens")
+
+    screens = data.get("screens", [])
 
     if not isinstance(screens, list):
         return False
 
     for screen in screens:
+
         if not isinstance(screen, dict):
             continue
 
         if screen.get("standard") != STANDARD:
             continue
 
+        compliant = screen.get(
+            "compliant"
+        )
+
+        borderline = screen.get(
+            "borderline"
+        )
+
+        debt_compliant = screen.get(
+            "debt_compliant"
+        )
+
         return (
-            screen.get("compliant") is True
-            and screen.get("borderline") is False
-            and screen.get("debt_compliant") is True
+            compliant is True
+            and borderline is False
+            and debt_compliant is True
         )
 
     return False
 
 
+# ==========================================
+# NON-PERMISSIBLE INCOME CHECK
+# ==========================================
+
 def income_check(data):
+
     business = data.get("business", {})
 
     if not isinstance(business, dict):
         return False
 
-    # لا نعتمد السهم حتى يوجد تحقق واضح
-    # من شرط الدخل غير المباح.
-    return business.get("income_test") == "pass"
+    income_test = business.get(
+        "income_test"
+    )
 
+    # Do not approve if income screening
+    # has not been independently verified.
+    return income_test == "pass"
+
+
+# ==========================================
+# EVALUATE STOCK
+# ==========================================
 
 def evaluate_stock(data):
+
     if not isinstance(data, dict):
         return "unknown"
 
@@ -136,8 +201,14 @@ def evaluate_stock(data):
     return "fully_verified"
 
 
+# ==========================================
+# FETCH MIZAN API
+# ==========================================
+
 def fetch_screen(session, symbol):
+
     try:
+
         response = session.get(
             f"{API_BASE}/{symbol}",
             timeout=REQUEST_TIMEOUT
@@ -162,24 +233,32 @@ def fetch_screen(session, symbol):
         return None, "timeout"
 
     except requests.RequestException as error:
+
         logger.warning(
             "%s request error: %s",
             symbol,
             error
         )
+
         return None, "request_error"
 
     except ValueError:
         return None, "invalid_json"
 
 
+# ==========================================
+# SAVE CANDIDATES
+# ==========================================
+
 def save_candidates(rows):
+
     with open(
         CANDIDATES_FILE,
         "w",
         encoding="utf-8",
         newline=""
     ) as file:
+
         writer = csv.writer(file)
 
         writer.writerow([
@@ -192,7 +271,12 @@ def save_candidates(rows):
         writer.writerows(rows)
 
 
+# ==========================================
+# MAIN
+# ==========================================
+
 def main():
+
     symbols = read_symbols()
 
     if CHECK_LIMIT > 0:
@@ -211,14 +295,17 @@ def main():
     ).isoformat()
 
     with requests.Session() as session:
+
         session.headers.update({
             "User-Agent": "HalalStockSignals/1.0",
             "Accept": "application/json"
         })
 
         for index, symbol in enumerate(
-            symbols, start=1
+            symbols,
+            start=1
         ):
+
             data, error = fetch_screen(
                 session,
                 symbol
@@ -239,13 +326,13 @@ def main():
                 status
             )
 
-            # نسجل الأسهم التي اجتازت
-            # النشاط والمديونية، حتى لو
-            # بقي فحص الدخل غير مكتمل.
+            # These are preliminary candidates.
+            # They are NOT fully approved stocks.
             if status in (
                 "income_not_verified",
                 "fully_verified"
             ):
+
                 candidates.append([
                     symbol,
                     status,
@@ -254,28 +341,39 @@ def main():
                 ])
 
             if status == "rate_limited":
+
                 logger.warning(
-                    "API rate limit reached. Stopping."
+                    "Mizan API rate limit reached."
                 )
+
                 break
 
             time.sleep(REQUEST_DELAY)
 
     save_candidates(candidates)
 
-    logger.info("Screening completed")
-    logger.info("Results: %s", dict(results))
+    logger.info(
+        "Screening completed"
+    )
+
+    logger.info(
+        "Results: %s",
+        dict(results)
+    )
+
     logger.info(
         "Candidates saved: %d",
         len(candidates)
     )
+
     logger.info(
         "Candidate file: %s",
         CANDIDATES_FILE
     )
 
     verified_count = results.get(
-        "fully_verified", 0
+        "fully_verified",
+        0
     )
 
     logger.info(
@@ -289,9 +387,11 @@ def main():
     )
 
     if verified_count == 0:
+
         logger.warning(
             "No fully verified stocks. "
-            "Income screening is still required."
+            "Independent income screening "
+            "is still required."
         )
 
 
