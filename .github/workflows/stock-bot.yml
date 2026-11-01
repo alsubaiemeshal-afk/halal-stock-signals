@@ -33,6 +33,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Test halal screening source
+        continue-on-error: true
+        env:
+          HALAL_CHECK_LIMIT: '20'
+        run: python halal_screen.py
+
       - name: Run stock scanner
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
