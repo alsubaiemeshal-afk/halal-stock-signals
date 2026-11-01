@@ -1,3 +1,10 @@
+"""
+Halal Stock Signals
+Mizan + Alpaca + Telegram
+
+Alerts only. No automatic orders.
+Fail-closed Sharia screening.
+"""
 
 import os
 import csv
@@ -10,12 +17,18 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
+from dotenv import load_dotenv
 
-# ======================================
-# CONFIGURATION
-# ======================================
+
+# =====================================
+# SETTINGS
+# =====================================
 
 ROOT = Path(__file__).resolve().parent
+load_dotenv(ROOT / ".env")
+
+NY = ZoneInfo("America/New_York")
+
 HALAL_FILE = ROOT / "approved_halal.csv"
 
 ALPACA_KEY = os.getenv("ALPACA_API_KEY", "")
@@ -24,26 +37,40 @@ ALPACA_SECRET = os.getenv("ALPACA_SECRET_KEY", "")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 
-DATA_URL = "https://data.alpaca.markets/v2/stocks"
-DATA_FEED = "iex"
+ALPACA_API = "https://data.alpaca.markets/v2/stocks"
+MIZAN_API = os.getenv(
+    "MIZAN_API_URL",
+    "https://askmizan.com/api/v1"
+).rstrip("/")
 
-NY = ZoneInfo("America/New_York")
+ALPACA_FEED = os.getenv(
+    "ALPACA_DATA_FEED", "iex"
+)
+
+MAX_REVIEW_AGE = int(
+    os.getenv("MAX_SCREEN_AGE_DAYS", "30")
+)
+
+MAX_PURIFY_AGE = int(
+    os.getenv("MAX_PURIFY_AGE_DAYS", "450")
+)
+
+HTTP = requests.Session()
 
 HEADERS = {
     "APCA-API-KEY-ID": ALPACA_KEY,
     "APCA-API-SECRET-KEY": ALPACA_SECRET
 }
 
-HTTP = requests.Session()
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s"
 )
 
-# ======================================
-# MARKET HOURS
-# ======================================
+
+# =====================================
+# MARKET SESSION
+# =====================================
 
 def market_session():
     now = datetime.now(NY)
@@ -65,51 +92,51 @@ def market_session():
     return None
 
 
-# ======================================
-# VERIFIED HALAL STOCKS
-# ======================================
+# =====================================
+# INDEPENDENT HALAL APPROVAL
+# =====================================
 
 def approved_stocks():
-    stocks = []
+    result = []
 
     if not HALAL_FILE.exists():
-        logging.warning("Halal file missing")
-        return stocks
+        logging.error("approved_halal.csv missing")
+        return result
 
     with HALAL_FILE.open(
-        newline="", encoding="utf-8-sig"
+        newline="",
+        encoding="utf-8-sig"
     ) as f:
 
         reader = csv.DictReader(f)
 
         required = {
             "symbol",
-            "verified_pure",
             "reviewed_at",
-            "source"
+            "source",
+            "verified_pure"
         }
 
-        if not required.issubset(reader.fieldnames or []):
-            logging.error("Invalid halal CSV columns")
-            return stocks
+        if not required.issubset(
+            reader.fieldnames or []
+        ):
+            logging.error("Invalid CSV columns")
+            return result
 
         for row in reader:
             try:
                 symbol = row["symbol"].strip().upper()
+                source = row["source"].strip()
 
-                if not re.fullmatch(
-                    r"[A-Z]{1,5}(\.[A-Z])?", symbol
-                ):
-                    continue
-
-                if row["verified_pure"].strip().lower() != "true":
-                    continue
-
-                if not row["source"].strip():
-                    continue
+                verified = (
+                    row["verified_pure"]
+                    .strip()
+                    .lower() == "true"
+                )
 
                 reviewed = datetime.strptime(
-                    row["reviewed_at"], "%Y-%m-%d"
+                    row["reviewed_at"],
+                    "%Y-%m-%d"
                 ).date()
 
                 age = (
@@ -117,41 +144,181 @@ def approved_stocks():
                     - reviewed
                 ).days
 
-                if not 0 <= age <= 30:
+                if not re.fullmatch(
+                    r"[A-Z]{1,5}(\.[A-Z])?",
+                    symbol
+                ):
                     continue
 
-                stocks.append(symbol)
+                if not verified:
+                    continue
 
-            except (ValueError, KeyError, AttributeError):
+                if not source:
+                    continue
+
+                if not 0 <= age <= MAX_REVIEW_AGE:
+                    continue
+
+                result.append(symbol)
+
+            except (
+                ValueError,
+                KeyError,
+                AttributeError,
+                TypeError
+            ):
                 continue
 
-    return sorted(set(stocks))
+    return sorted(set(result))
 
 
-# ======================================
-# ALPACA MARKET DATA
-# ======================================
+# =====================================
+# MIZAN SHARIA CHECK
+# =====================================
+
+def mizan_check(symbol):
+    """
+    Requires:
+    - permitted main business
+    - four passing standards
+    - no borderline verdict
+    - latest available interest-income
+      purification ratio exactly zero
+
+    This is an additional conservative
+    filter, not a full purity certificate.
+    """
+
+    try:
+        response = HTTP.get(
+            f"{MIZAN_API}/screen/{symbol}",
+            timeout=20
+        )
+
+        response.raise_for_status()
+        data = response.json()
+
+        business = data.get("business", {})
+
+        if business.get("main_business") != "permitted":
+            return False
+
+        # Mizan explicitly does not check
+        # prohibited side-income here.
+        if business.get("income_test") is None:
+            return False
+
+        screens = data.get("screens", [])
+
+        standards = {
+            "AAOIFI",
+            "DJIM",
+            "SP",
+            "MSCI"
+        }
+
+        if {
+            s.get("standard") for s in screens
+        } != standards:
+            return False
+
+        for screen in screens:
+            if screen.get("compliant") is not True:
+                return False
+
+            if screen.get("borderline") is not False:
+                return False
+
+        purify_response = HTTP.get(
+            f"{MIZAN_API}/purify/{symbol}",
+            timeout=20
+        )
+
+        purify_response.raise_for_status()
+        purify = purify_response.json()
+
+        ratio = purify.get("ratio")
+        interest = purify.get("interest_income")
+        period = purify.get("period_end")
+        latest = purify.get("latest_annual_filing")
+
+        if (
+            ratio is None
+            or interest is None
+            or not period
+            or not latest
+        ):
+            return False
+
+        # A positive purification ratio
+        # is not acceptable for this bot.
+        if float(ratio) != 0:
+            return False
+
+        if float(interest) != 0:
+            return False
+
+        report_date = datetime.strptime(
+            period, "%Y-%m-%d"
+        ).date()
+
+        latest_date = datetime.strptime(
+            latest, "%Y-%m-%d"
+        ).date()
+
+        if report_date != latest_date:
+            return False
+
+        age = (
+            datetime.now(timezone.utc).date()
+            - report_date
+        ).days
+
+        if not 0 <= age <= MAX_PURIFY_AGE:
+            return False
+
+        logging.info(
+            "Mizan checks passed: %s",
+            symbol
+        )
+
+        return True
+
+    except (
+        requests.RequestException,
+        ValueError,
+        TypeError,
+        KeyError
+    ):
+        logging.exception(
+            "Mizan check failed: %s",
+            symbol
+        )
+        return False
+
+
+# =====================================
+# ALPACA DATA
+# =====================================
 
 def get_bars(symbol, timeframe, start, end):
-
     response = HTTP.get(
-        f"{DATA_URL}/{symbol}/bars",
+        f"{ALPACA_API}/{symbol}/bars",
         headers=HEADERS,
         params={
             "timeframe": timeframe,
             "start": start.isoformat(),
             "end": end.isoformat(),
-            "feed": DATA_FEED,
-            "adjustment": "raw",
-            "limit": 10000
+            "limit": 10000,
+            "feed": ALPACA_FEED,
+            "adjustment": "raw"
         },
         timeout=25
     )
 
     response.raise_for_status()
 
-    payload = response.json()
-    rows = payload.get("bars", [])
+    rows = response.json().get("bars", [])
 
     if not rows:
         return pd.DataFrame()
@@ -171,15 +338,17 @@ def get_bars(symbol, timeframe, start, end):
         df["time"], utc=True
     )
 
-    return df.sort_values("time").set_index("time")
+    return (
+        df.sort_values("time")
+        .set_index("time")
+    )
 
 
-# ======================================
+# =====================================
 # INDICATORS
-# ======================================
+# =====================================
 
 def calculate_rsi(close, period=14):
-
     delta = close.diff()
 
     gain = delta.clip(lower=0)
@@ -201,7 +370,7 @@ def calculate_rsi(close, period=14):
         0, float("nan")
     )
 
-    result = 100 - (100 / (1 + rs))
+    result = 100 - 100 / (1 + rs)
 
     result = result.mask(
         (avg_loss == 0) & (avg_gain > 0),
@@ -217,19 +386,18 @@ def calculate_rsi(close, period=14):
 
 
 def calculate_atr(df, period=14):
+    previous = df["close"].shift()
 
-    previous_close = df["close"].shift()
-
-    true_range = pd.concat(
+    tr = pd.concat(
         [
             df["high"] - df["low"],
-            (df["high"] - previous_close).abs(),
-            (df["low"] - previous_close).abs()
+            (df["high"] - previous).abs(),
+            (df["low"] - previous).abs()
         ],
         axis=1
     ).max(axis=1)
 
-    return true_range.ewm(
+    return tr.ewm(
         alpha=1 / period,
         adjust=False,
         min_periods=period
@@ -237,33 +405,32 @@ def calculate_atr(df, period=14):
 
 
 def calculate_vwap(df):
-
-    typical_price = (
-        df["high"] + df["low"] + df["close"]
+    typical = (
+        df["high"]
+        + df["low"]
+        + df["close"]
     ) / 3
 
-    cumulative_volume = df["volume"].cumsum()
+    volume = df["volume"].cumsum()
 
     return (
-        (typical_price * df["volume"]).cumsum()
-        / cumulative_volume.replace(0, float("nan"))
+        (typical * df["volume"]).cumsum()
+        / volume.replace(0, float("nan"))
     )
 
 
-# ======================================
-# SESSION DATA
-# ======================================
+# =====================================
+# FILTER MARKET SESSION
+# =====================================
 
 def filter_session(df, session):
-
     if df.empty:
         return df
 
     df = df.tz_convert(NY)
 
     today = datetime.now(NY).date()
-
-    df = df[df.index.date == today]
+    df = df[df.index.date == today].copy()
 
     if session == "PRE-MARKET":
         return df.between_time(
@@ -283,12 +450,11 @@ def filter_session(df, session):
     return df.iloc[0:0].copy()
 
 
-# ======================================
-# SIGNAL ENGINE
-# ======================================
+# =====================================
+# SIGNAL ANALYSIS
+# =====================================
 
 def analyze(symbol, one, five, session):
-
     one = filter_session(one, session)
     five = filter_session(five, session)
 
@@ -296,14 +462,8 @@ def analyze(symbol, one, five, session):
         return None
 
     one["vwap"] = calculate_vwap(one)
-
-    one["rsi"] = calculate_rsi(
-        one["close"], 14
-    )
-
-    one["atr"] = calculate_atr(
-        one, 14
-    )
+    one["rsi"] = calculate_rsi(one["close"])
+    one["atr"] = calculate_atr(one)
 
     one["rvol"] = (
         one["volume"]
@@ -313,11 +473,13 @@ def analyze(symbol, one, five, session):
     )
 
     five["ema8"] = five["close"].ewm(
-        span=8, adjust=False
+        span=8,
+        adjust=False
     ).mean()
 
     five["ema20"] = five["close"].ewm(
-        span=20, adjust=False
+        span=20,
+        adjust=False
     ).mean()
 
     x = one.iloc[-1]
@@ -335,16 +497,20 @@ def analyze(symbol, one, five, session):
     if not all(pd.notna(v) for v in values):
         return None
 
-    if not (
+    conditions = (
         x["close"] > x["vwap"]
         and trend["ema8"] > trend["ema20"]
         and 50 <= x["rsi"] <= 70
         and x["rvol"] >= 1.5
         and x["atr"] > 0
-    ):
+    )
+
+    if not conditions:
         return None
 
-    previous_high = one["high"].iloc[-6:-1].max()
+    previous_high = (
+        one["high"].iloc[-6:-1].max()
+    )
 
     if x["close"] <= previous_high:
         return None
@@ -370,19 +536,16 @@ def analyze(symbol, one, five, session):
     }
 
 
-# ======================================
+# =====================================
 # TELEGRAM
-# ======================================
+# =====================================
 
 def send_telegram(message):
-
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{TELEGRAM_TOKEN}/sendMessage"
-    )
-
     response = HTTP.post(
-        url,
+        (
+            "https://api.telegram.org/"
+            f"bot{TELEGRAM_TOKEN}/sendMessage"
+        ),
         json={
             "chat_id": TELEGRAM_CHAT,
             "text": message
@@ -394,7 +557,6 @@ def send_telegram(message):
 
 
 def format_alert(result):
-
     return (
         "📈 HALAL STOCK SIGNAL\n\n"
         f"السهم: {result['symbol']}\n"
@@ -409,12 +571,11 @@ def format_alert(result):
     )
 
 
-# ======================================
-# MAIN SCANNER
-# ======================================
+# =====================================
+# MAIN
+# =====================================
 
 def run():
-
     if not all([
         ALPACA_KEY,
         ALPACA_SECRET,
@@ -437,35 +598,52 @@ def run():
 
     if not stocks:
         logging.warning(
-            "No verified pure halal stocks"
+            "No independently verified pure stocks"
         )
         return
 
     logging.info(
-        "Scanning %d stocks - %s",
+        "Scanning %d stocks in %s",
         len(stocks),
         session
     )
 
-    end = datetime.now(timezone.utc) - timedelta(
-        seconds=90
+    end = (
+        datetime.now(timezone.utc)
+        - timedelta(seconds=90)
     )
 
     start = end - timedelta(days=3)
 
     for symbol in stocks:
-
         try:
+            # Sharia checks happen first.
+            if not mizan_check(symbol):
+                logging.info(
+                    "Sharia check rejected: %s",
+                    symbol
+                )
+                continue
+
             one = get_bars(
-                symbol, "1Min", start, end
+                symbol,
+                "1Min",
+                start,
+                end
             )
 
             five = get_bars(
-                symbol, "5Min", start, end
+                symbol,
+                "5Min",
+                start,
+                end
             )
 
             result = analyze(
-                symbol, one, five, session
+                symbol,
+                one,
+                five,
+                session
             )
 
             if result:
@@ -474,17 +652,19 @@ def run():
                 )
 
                 logging.info(
-                    "Signal sent: %s", symbol
+                    "Alert sent: %s",
+                    symbol
                 )
-
             else:
                 logging.info(
-                    "No signal: %s", symbol
+                    "No signal: %s",
+                    symbol
                 )
 
         except Exception:
             logging.exception(
-                "Error scanning %s", symbol
+                "Error scanning %s",
+                symbol
             )
 
     logging.info("Scan completed")
@@ -492,3 +672,4 @@ def run():
 
 if __name__ == "__main__":
     run()
+    
