@@ -32,6 +32,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # Restore halal screening cache
       - name: Restore halal screening cache
         uses: actions/cache/restore@v4
         with:
@@ -40,10 +41,12 @@ jobs:
           restore-keys: |
             halal-mizan-
 
+      # Screen halal stocks
       - name: Screen halal stocks
         id: halal
         run: python halal_screen.py
 
+      # Save halal screening cache
       - name: Save updated halal cache
         if: steps.halal.outputs.cache_changed == 'true'
         uses: actions/cache/save@v4
@@ -51,6 +54,16 @@ jobs:
           path: .cache/halal_mizan.json
           key: halal-mizan-${{ github.run_id }}-${{ github.run_attempt }}
 
+      # Restore Telegram notification state
+      - name: Restore Telegram state
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache/telegram_state.json
+          key: telegram-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            telegram-state-
+
+      # Run technical stock scanner
       - name: Run stock scanner
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
@@ -60,6 +73,15 @@ jobs:
           TEST_MODE: 'true'
         run: python bot.py
 
+      # Save Telegram notification state
+      - name: Save Telegram state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .cache/telegram_state.json
+          key: telegram-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # Upload screening reports
       - name: Upload screening report
         if: always()
         uses: actions/upload-artifact@v4
