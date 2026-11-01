@@ -1,109 +1,132 @@
 
 import csv
-import io
 import logging
+import math
 import os
 import re
 import time
-from datetime import datetime, timezone, date
+from datetime import date, datetime, timezone
 
 import requests
 
-WALLET_URL = (
+
+# ==========================================
+# SETTINGS
+# ==========================================
+
+HALALWALLET_URL = (
     "https://www.halalwallet.us/api/data/"
     "halal-stock-screening-data-us.json"
 )
-MIZAN_URL = "https://askmizan.com/api/v1/screen"
 
-NASDAQ_URL = (
-    "https://www.nasdaqtrader.com/dynamic/"
-    "SymDir/nasdaqlisted.txt"
-)
-OTHER_URL = (
-    "https://www.nasdaqtrader.com/dynamic/"
-    "SymDir/otherlisted.txt"
-)
+MIZAN_URL = "https://askmizan.com/api/v1/screen"
 
 APPROVED_FILE = "approved_halal.csv"
 REPORT_FILE = "halal_candidates.csv"
 
-MAX_AGE_DAYS = 365
-TIMEOUT = 30
+STANDARD = "AAOIFI"
+
+MAX_DATA_AGE_DAYS = int(
+    os.getenv("MAX_DATA_AGE_DAYS", "365")
+)
+
+CHECK_LIMIT = int(
+    os.getenv("HALAL_CHECK_LIMIT", "0")
+)
+
+REQUEST_TIMEOUT = 20
+REQUEST_DELAY = 0.5
+
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s"
 )
-log = logging.getLogger(__name__)
+
+logger = logging.getLogger(__name__)
 
 
-def valid_symbol(value):
+# ==========================================
+# SYMBOL VALIDATION
+# ==========================================
+
+def valid_symbol(symbol):
+
     return (
-        isinstance(value, str)
+        isinstance(symbol, str)
         and re.fullmatch(
             r"[A-Z][A-Z0-9.-]{0,9}",
-            value.upper()
+            symbol.upper()
         ) is not None
     )
 
 
-def fresh(value):
+# ==========================================
+# DATE VALIDATION
+# ==========================================
+
+def is_recent(value):
+
     if not isinstance(value, str):
         return False
+
     try:
-        d = date.fromisoformat(value[:10])
-        age = (datetime.now(timezone.utc).date() - d).days
-        return 0 <= age <= MAX_AGE_DAYS
+
+        data_date = date.fromisoformat(
+            value[:10]
+        )
+
+        today = datetime.now(
+            timezone.utc
+        ).date()
+
+        age = (today - data_date).days
+
+        return (
+            0 <= age <= MAX_DATA_AGE_DAYS
+        )
+
     except ValueError:
         return False
 
 
-def fetch_listed(session):
-    symbols = set()
+# ==========================================
+# NUMERIC VALIDATION
+# ==========================================
 
-    for url, field in (
-        (NASDAQ_URL, "Symbol"),
-        (OTHER_URL, "ACT Symbol"),
-    ):
-        response = session.get(url, timeout=TIMEOUT)
-        response.raise_for_status()
+def valid_percentage(value, maximum):
 
-        reader = csv.DictReader(
-            io.StringIO(response.text),
-            delimiter="|"
-        )
+    if isinstance(value, bool):
+        return False
 
-        for row in reader:
-            symbol = row.get(field, "").strip().upper()
+    if not isinstance(value, (int, float)):
+        return False
 
-            if not valid_symbol(symbol):
-                continue
+    if not math.isfinite(value):
+        return False
 
-            if row.get("Test Issue", "N") == "Y":
-                continue
+    return 0 <= value <= maximum
 
-            if row.get("ETF", "N") == "Y":
-                continue
 
-            symbols.add(symbol)
-
-    if not symbols:
-        raise RuntimeError("No exchange symbols downloaded")
-
-    return symbols
-
+# ==========================================
+# HALALWALLET SCREENING
+# ==========================================
 
 def wallet_pass(row):
+
+    if not isinstance(row, dict):
+        return False
+
     if row.get("entityType") != "stock":
         return False
 
-    if row.get("basis") != "AAOIFI":
+    if row.get("basis") != STANDARD:
         return False
 
     if row.get("verdict") != "halal":
         return False
 
-    flags = (
+    required_flags = (
         "businessActivityPass",
         "financialScreenPass",
         "debtPass",
@@ -112,36 +135,57 @@ def wallet_pass(row):
         "filingVerified",
     )
 
-    if not all(row.get(k) is True for k in flags):
-        return False
+    for field in required_flags:
 
-    for key, limit in (
+        if row.get(field) is not True:
+            return False
+
+    percentage_limits = (
         ("debtPct", 30),
         ("cashPct", 30),
         ("impermissibleIncomePct", 5),
-    ):
-        value = row.get(key)
+    )
 
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not 0 <= value <= limit
+    for field, limit in percentage_limits:
+
+        if not valid_percentage(
+            row.get(field),
+            limit
         ):
             return False
 
-    return fresh(row.get("dataAsOf"))
+    if not is_recent(
+        row.get("dataAsOf")
+    ):
+        return False
 
+    return True
+
+
+# ==========================================
+# MIZAN SCREENING
+# ==========================================
 
 def mizan_pass(data, symbol):
+
     if not isinstance(data, dict):
         return False
 
-    if str(data.get("ticker", "")).upper() != symbol:
+    api_symbol = str(
+        data.get("ticker", "")
+    ).upper()
+
+    if api_symbol != symbol:
         return False
 
-    business = data.get("business", {})
-    summary = data.get("summary", {})
-    screens = data.get("screens", [])
+    if not is_recent(
+        data.get("as_of")
+    ):
+        return False
+
+    business = data.get("business")
+    summary = data.get("summary")
+    screens = data.get("screens")
 
     if not isinstance(business, dict):
         return False
@@ -152,115 +196,231 @@ def mizan_pass(data, symbol):
     if not isinstance(screens, list):
         return False
 
-    if business.get("main_business") != "permitted":
+    if business.get(
+        "main_business"
+    ) != "permitted":
         return False
 
-    if summary.get("business_screen") != "pass":
+    if summary.get(
+        "business_screen"
+    ) != "pass":
         return False
 
-    standards = business.get("by_standard", {})
+    by_standard = business.get(
+        "by_standard"
+    )
 
-    if not isinstance(standards, dict):
+    if not isinstance(by_standard, dict):
         return False
 
-    if standards.get("AAOIFI") != "pass":
-        return False
-
-    if not fresh(data.get("as_of")):
+    if by_standard.get(
+        STANDARD
+    ) != "pass":
         return False
 
     for screen in screens:
-        if (
-            isinstance(screen, dict)
-            and screen.get("standard") == "AAOIFI"
-        ):
-            return (
-                screen.get("compliant") is True
-                and screen.get("debt_compliant") is True
-                and screen.get("borderline") is False
-            )
+
+        if not isinstance(screen, dict):
+            continue
+
+        if screen.get(
+            "standard"
+        ) != STANDARD:
+            continue
+
+        return (
+            screen.get("compliant") is True
+            and screen.get("debt_compliant") is True
+            and screen.get("borderline") is False
+        )
 
     return False
 
 
+# ==========================================
+# FETCH HALALWALLET DATA
+# ==========================================
+
+def fetch_wallet(session):
+
+    response = session.get(
+        HALALWALLET_URL,
+        timeout=REQUEST_TIMEOUT
+    )
+
+    response.raise_for_status()
+
+    payload = response.json()
+
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            "Invalid HalalWallet response"
+        )
+
+    records = payload.get("records")
+
+    if not isinstance(records, list):
+        raise RuntimeError(
+            "Missing HalalWallet records"
+        )
+
+    if not records:
+        raise RuntimeError(
+            "HalalWallet records are empty"
+        )
+
+    return records
+
+
+# ==========================================
+# FETCH MIZAN DATA
+# ==========================================
+
+def fetch_mizan(session, symbol):
+
+    try:
+
+        response = session.get(
+            f"{MIZAN_URL}/{symbol}",
+            timeout=REQUEST_TIMEOUT
+        )
+
+        if response.status_code == 404:
+            return None, "not_in_mizan"
+
+        if response.status_code == 429:
+            return None, "rate_limited"
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        if not isinstance(data, dict):
+            return None, "invalid_response"
+
+        return data, None
+
+    except requests.Timeout:
+        return None, "timeout"
+
+    except requests.RequestException as error:
+
+        logger.warning(
+            "%s API error: %s",
+            symbol,
+            error
+        )
+
+        return None, "api_error"
+
+    except ValueError:
+        return None, "invalid_json"
+
+
+# ==========================================
+# WRITE CSV
+# ==========================================
+
 def write_csv(path, header, rows):
+
     with open(
-        path, "w",
+        path,
+        "w",
         newline="",
         encoding="utf-8"
-    ) as f:
-        writer = csv.writer(f)
+    ) as file:
+
+        writer = csv.writer(file)
+
         writer.writerow(header)
         writer.writerows(rows)
 
 
+# ==========================================
+# MAIN
+# ==========================================
+
 def main():
+
+    logger.info(
+        "Starting automatic halal screening"
+    )
+
     session = requests.Session()
+
     session.headers.update({
         "User-Agent": "HalalStockSignals/1.0",
-        "Accept": "application/json",
+        "Accept": "application/json"
     })
 
-    listed = fetch_listed(session)
-    log.info("US exchange symbols: %d", len(listed))
+    records = fetch_wallet(session)
 
-    response = session.get(WALLET_URL, timeout=TIMEOUT)
-    response.raise_for_status()
+    logger.info(
+        "HalalWallet total records: %d",
+        len(records)
+    )
 
-    payload = response.json()
-    records = payload.get("records")
-
-    if not isinstance(records, list) or not records:
-        raise RuntimeError("Invalid HalalWallet dataset")
-
-    # Only currently listed, covered, verified stocks.
+    # Select candidates from HalalWallet.
+    # No Nasdaq Trader request is needed.
     candidates = {}
 
     for row in records:
+
         if not isinstance(row, dict):
             continue
 
-        symbol = str(row.get("ticker") or "").upper()
+        symbol = str(
+            row.get("ticker") or ""
+        ).strip().upper()
 
-        if (
-            symbol in listed
-            and wallet_pass(row)
-        ):
+        if not valid_symbol(symbol):
+            continue
+
+        if wallet_pass(row):
             candidates[symbol] = row
 
-    log.info(
+    symbols = sorted(candidates)
+
+    logger.info(
         "HalalWallet eligible candidates: %d",
-        len(candidates)
+        len(symbols)
+    )
+
+    if CHECK_LIMIT > 0:
+        symbols = symbols[:CHECK_LIMIT]
+
+    logger.info(
+        "Mizan symbols to check: %d",
+        len(symbols)
     )
 
     approved = []
     report = []
 
-    checked_at = datetime.now(timezone.utc).isoformat()
+    checked_at = datetime.now(
+        timezone.utc
+    ).isoformat()
 
     for index, symbol in enumerate(
-        sorted(candidates), 1
+        symbols,
+        start=1
     ):
-        try:
-            response = session.get(
-                f"{MIZAN_URL}/{symbol}",
-                timeout=15
-            )
 
-            if response.status_code == 404:
-                status = "not_in_mizan"
-            else:
-                response.raise_for_status()
+        data, error = fetch_mizan(
+            session,
+            symbol
+        )
 
-                if mizan_pass(response.json(), symbol):
-                    status = "approved"
-                    approved.append(symbol)
-                else:
-                    status = "mizan_not_approved"
+        if error:
+            status = error
 
-        except (requests.RequestException, ValueError) as exc:
-            log.warning("%s API error: %s", symbol, exc)
-            status = "api_error"
+        elif mizan_pass(data, symbol):
+
+            status = "approved"
+            approved.append(symbol)
+
+        else:
+            status = "mizan_not_approved"
 
         report.append([
             symbol,
@@ -268,34 +428,70 @@ def main():
             checked_at
         ])
 
-        log.info(
+        logger.info(
             "%d/%d %s: %s",
             index,
-            len(candidates),
+            len(symbols),
             symbol,
             status
         )
 
-        time.sleep(0.5)
+        if status == "rate_limited":
 
-    # Fail closed: never keep an old approval list.
+            logger.warning(
+                "Mizan rate limit reached"
+            )
+
+            break
+
+        time.sleep(REQUEST_DELAY)
+
+    # Always replace the previous approved list.
+    # Never retain stale approvals.
     write_csv(
         APPROVED_FILE,
         ["symbol"],
-        [[symbol] for symbol in approved]
+        [
+            [symbol]
+            for symbol in sorted(approved)
+        ]
     )
 
     write_csv(
         REPORT_FILE,
-        ["symbol", "status", "checked_at_utc"],
+        [
+            "symbol",
+            "status",
+            "checked_at_utc"
+        ],
         report
     )
 
-    log.info("Approved stocks: %d", len(approved))
-    log.info("Screening completed")
+    logger.info(
+        "Screening completed"
+    )
+
+    logger.info(
+        "Approved stocks: %d",
+        len(approved)
+    )
+
+    logger.info(
+        "Approved file: %s",
+        APPROVED_FILE
+    )
+
+    logger.info(
+        "Report file: %s",
+        REPORT_FILE
+    )
 
     if not approved:
-        log.warning("No approved stocks. No signals allowed.")
+
+        logger.warning(
+            "No approved stocks. "
+            "No trading signals allowed."
+        )
 
 
 if __name__ == "__main__":
