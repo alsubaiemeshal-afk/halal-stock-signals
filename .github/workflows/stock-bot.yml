@@ -1,4 +1,3 @@
-
 name: Halal Stock Signals 24H
 
 on:
@@ -17,7 +16,6 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -32,7 +30,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Restore halal screening cache
       - name: Restore halal screening cache
         uses: actions/cache/restore@v4
         with:
@@ -41,21 +38,18 @@ jobs:
           restore-keys: |
             halal-mizan-
 
-      # Screen halal stocks
       - name: Screen halal stocks
         id: halal
         run: python halal_screen.py
 
-      # Save halal screening cache
-      - name: Save updated halal cache
+      - name: Save halal screening cache
         if: steps.halal.outputs.cache_changed == 'true'
         uses: actions/cache/save@v4
         with:
           path: .cache/halal_mizan.json
           key: halal-mizan-${{ github.run_id }}-${{ github.run_attempt }}
 
-      # Restore Telegram notification state
-      - name: Restore Telegram state
+      - name: Restore Telegram scanner state
         uses: actions/cache/restore@v4
         with:
           path: .cache/telegram_state.json
@@ -63,26 +57,27 @@ jobs:
           restore-keys: |
             telegram-state-
 
-      # Run technical stock scanner
-      - name: Run stock scanner
+      - name: Run technical stock scanner
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TEST_MODE: 'true'
+          HALAL_SOURCE_VERIFIED: 'false'
+          MAX_SYMBOLS: '40'
+          MAX_BAR_AGE_MINUTES: '3'
+          POLL_SECONDS: '60'
+          RUN_SECONDS: '210'
         run: python bot.py
 
-      # Save Telegram notification state
-      - name: Save Telegram state
-        if: always()
+      - name: Save Telegram scanner state
+        if: always() && hashFiles('.cache/telegram_state.json') != ''
         uses: actions/cache/save@v4
         with:
           path: .cache/telegram_state.json
           key: telegram-state-${{ github.run_id }}-${{ github.run_attempt }}
 
-      # Upload screening reports
-      - name: Upload screening report
+      - name: Upload screening reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
