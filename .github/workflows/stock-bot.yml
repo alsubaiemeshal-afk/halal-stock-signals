@@ -1,4 +1,5 @@
-name: Halal Stock Signals 24H
+
+name: US Stock Signals 24H
 
 on:
   workflow_dispatch:
@@ -9,7 +10,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: halal-stock-signals
+  group: us-stock-signals
   cancel-in-progress: false
 
 jobs:
@@ -26,30 +27,9 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
-      - name: Restore halal screening cache
-        uses: actions/cache/restore@v4
-        with:
-          path: .cache/halal_mizan.json
-          key: halal-mizan-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: |
-            halal-mizan-
-
-      - name: Screen halal stocks
-        id: halal
-        run: python halal_screen.py
-
-      - name: Save halal screening cache
-        if: steps.halal.outputs.cache_changed == 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: .cache/halal_mizan.json
-          key: halal-mizan-${{ github.run_id }}-${{ github.run_attempt }}
-
-      - name: Restore Telegram scanner state
+      - name: Restore Telegram state
         uses: actions/cache/restore@v4
         with:
           path: .cache/telegram_state.json
@@ -57,33 +37,21 @@ jobs:
           restore-keys: |
             telegram-state-
 
-      - name: Run technical stock scanner
+      - name: Run stock scanner
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          HALAL_SOURCE_VERIFIED: 'false'
           MAX_SYMBOLS: '40'
           MAX_BAR_AGE_MINUTES: '3'
           POLL_SECONDS: '60'
           RUN_SECONDS: '210'
         run: python bot.py
 
-      - name: Save Telegram scanner state
+      - name: Save Telegram state
         if: always() && hashFiles('.cache/telegram_state.json') != ''
         uses: actions/cache/save@v4
         with:
           path: .cache/telegram_state.json
           key: telegram-state-${{ github.run_id }}-${{ github.run_attempt }}
-
-      - name: Upload screening reports
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: halal-screening-report
-          path: |
-            halal_candidates.csv
-            approved_halal.csv
-          if-no-files-found: warn
-          retention-days: 7
