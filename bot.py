@@ -238,7 +238,7 @@ def signal_message(x):
             f'🕒 توقيت الشمعة (السعودية): {sa_time}\n'
             f'⌛ عمر الشمعة: {x["age"]:.1f} دقيقة\n\n'
             'المصدر: Alpaca IEX فقط (تغطية جزئية). الأسعار ليست عرض تنفيذ مباشر. '
-            'الاعتماد الشرعي يعتمد على القائمة التي تحقق منها المشغل، وليس ضمانًا من البوت.')
+            'لا يتم فحص التوافق الشرعي للأسهم.')
 
 
 def main():
@@ -251,10 +251,8 @@ def main():
     state['alerts'] = {k: v for k, v in state['alerts'].items()
                        if parse_dt(v) is not None and parse_dt(v) >= expiry}
     market = market_symbols()
-    halal = approved_symbols()
-    eligible = sorted(market & halal)
-    if not eligible:
-        LOG.warning('No eligible verified symbols; no trade alerts')
+    eligible = sorted(market)
+    LOG.info('Scanning listed US common stocks without Sharia filter')
     cursor = int(state.get('cursor', 0)) % max(1, len(eligible))
     batch = [eligible[(cursor+i) % len(eligible)] for i in range(min(MAX_SYMBOLS, len(eligible)))] if eligible else []
     state['cursor'] = (cursor + len(batch)) % len(eligible) if eligible else 0
@@ -282,10 +280,10 @@ def main():
     last_summary = parse_dt(state.get('last_summary'))
     if last_summary is None or utc() - last_summary >= timedelta(hours=SUMMARY_HOURS):
         msg = (f'📊 تقرير البوت — {utc().astimezone(SA):%Y-%m-%d %H:%M} السعودية\n'
-               f'السوق: {len(market)} | القائمة المتحقق منها: {len(halal)}\n'
+               f'الأسهم الأمريكية المدرجة: {len(market)} | بدون فلتر شرعي\n'
                f'المؤهلة: {len(eligible)} | فُحصت: {analyzed}\n'
                f'إشارات مرسلة: {sent} | أخطاء: {errors}\n'
-               f'تفعيل مصدر النقاوة بعد التحقق المستقل: {VERIFIED}\n'
+               'لا يتم فحص النقاوة الشرعية.\n'
                'IEX جزئي، لا يوجد تنفيذ صفقات.')
         if telegram(msg):
             state['last_summary'] = utc().isoformat()
