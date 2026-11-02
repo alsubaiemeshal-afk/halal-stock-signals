@@ -2,6 +2,7 @@
 import io
 import json
 import logging
+import time
 import os
 import re
 from datetime import datetime, timedelta, timezone
@@ -34,20 +35,22 @@ TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 HALAL_FILE = "approved_halal.csv"
 STATE_FILE = Path(".cache/telegram_state.json")
 
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "30"))
+MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "40"))
 MIN_PRICE = float(os.getenv("MIN_PRICE", "1"))
-MAX_PRICE = float(os.getenv("MAX_PRICE", "30"))
-MIN_RVOL = float(os.getenv("MIN_RVOL", "1.5"))
+MAX_PRICE = float(os.getenv("MAX_PRICE", "100"))
+MIN_RVOL = float(os.getenv("MIN_RVOL", "1.3"))
 MIN_VOLUME = int(
-    os.getenv("MIN_IEX_SESSION_VOLUME", "50000")
+    os.getenv("MIN_IEX_SESSION_VOLUME", "10000")
 )
 
 TEST_MODE = os.getenv(
-    "TEST_MODE", "true"
+    "TEST_MODE", "false"
 ).lower() == "true"
 
 TIMEOUT = 25
 SUMMARY_HOURS = 6
+POLL_SECONDS = max(30, int(os.getenv("POLL_SECONDS", "60")))
+RUN_SECONDS = max(0, int(os.getenv("RUN_SECONDS", "210")))
 ALERT_EXPIRY_DAYS = 7
 
 
@@ -231,10 +234,10 @@ def get_bars(symbol):
 
     params = {
         "symbols": symbol,
-        "timeframe": "5Min",
+        "timeframe": "1Min",
         "start": start.isoformat(),
         "end": end.isoformat(),
-        "limit": 1000,
+        "limit": 500,
         "feed": "iex",
         "adjustment": "raw",
         "sort": "desc",
@@ -267,10 +270,10 @@ def get_bars(symbol):
         .reset_index(drop=True)
     )
 
-    # Exclude unfinished 5-minute candles.
+    # Exclude unfinished one-minute candles.
     cutoff = (
         pd.Timestamp.now(tz="UTC")
-        .floor("5min")
+        .floor("min")
     )
 
     df = df[df["t"] < cutoff].copy()
@@ -504,7 +507,7 @@ def main():
             if not result["qualifies"]:
                 continue
 
-            if result["age"] > 15:
+            if result["age"] > 4:
                 historical_count += 1
                 continue
 
@@ -570,4 +573,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    deadline = time.monotonic() + RUN_SECONDS
+    while True:
+        try:
+            main()
+        except Exception:
+            LOG.exception("Scanner iteration failed")
+        if time.monotonic() + POLL_SECONDS >= deadline:
+            break
+        time.sleep(POLL_SECONDS)
