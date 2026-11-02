@@ -206,7 +206,8 @@ def analyze(symbol):
     price = float(last['c'])
     # Genuine new 20-bar breakout, not a persistent bullish trend.
     resistance = float(df['h'].shift(1).rolling(20).max().iloc[-1])
-    breakout = float(before['c']) <= resistance < price
+    previous_resistance = float(df['h'].shift(1).rolling(20).max().iloc[-2])
+    breakout = float(before['c']) <= previous_resistance and price > resistance
     volume = int(today['v'].sum())
     qualifies = (MIN_PRICE <= price <= MAX_PRICE and volume >= MIN_VOLUME
                  and breakout and price > float(last['vwap'])
@@ -243,6 +244,8 @@ def signal_message(x):
 def main():
     if not KEY or not SECRET:
         raise RuntimeError('Missing Alpaca GitHub secrets')
+    if not TOKEN or not CHAT:
+        raise RuntimeError('Missing Telegram GitHub secrets')
     state = state_load()
     expiry = utc() - timedelta(days=7)
     state['alerts'] = {k: v for k, v in state['alerts'].items()

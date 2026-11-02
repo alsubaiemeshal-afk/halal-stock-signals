@@ -16,3 +16,12 @@
 - Run the halal screening workflow and check source freshness before relying on purity status.
 
 For true continuous second-level streaming, move to an always-on host and use a licensed real-time feed.
+
+
+## Important diagnostic / safety
+- `python diagnose.py` reports missing configuration and whether the approved universe is empty, without printing secrets.
+- This project deliberately **does not** label unverified stocks halal. `HALAL_SOURCE_VERIFIED=false` prevents trade alerts. Only set it true after independently validating the source, methodology, and freshness of the screening data.
+- The default screening workflow is not an independent guarantee of Sharia compliance.
+- A genuine prior-20-bar breakout is required; this fixes the previous resistance comparison.
+- No alerts outside the US regular trading session; premarket/after-hours requires a separately validated data and strategy change.
+- GitHub Actions is scheduled, not continuously real-time; actual executions can be delayed.
